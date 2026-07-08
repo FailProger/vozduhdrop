@@ -1,10 +1,13 @@
 package com.failproger.vozduhdrop.ui
 
+import android.Manifest
 import android.content.ComponentName
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.widget.Button
-import android.util.Log
+import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
 import androidx.lifecycle.lifecycleScope
@@ -19,53 +22,70 @@ class MainActivity : AppCompatActivity() {
     private lateinit var aid: String
     private lateinit var nfcReader: NfcReader
     private lateinit var hceComponent: ComponentName
+    private var nfcData: String? = null
     // WiFi-Direct
     private lateinit var wifiDirectManager: WifiDirectManager
+    // View
+    private lateinit var txtModeStatus: TextView
     // States
-    private var isReaderMode = false
+    private var isNfcReaderMode = false
     private var isHceMode = false
+    private var isWifiDirectOn = false
+    // Permissions
+    private lateinit var wifiDirectPermission: String
+    private val switchModeLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted -> if (granted) switchMode() }
+    private val connectToDeviceLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            val parts = nfcData!!.split(":", limit = 2)
+            val ssid = parts[0]
+            val pass = parts[1]
+
+            wifiDirectManager.connectToDevice(ssid, pass)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        initView()
         setupNfc()
         setupWifiDirect()
+
+        initView()
     }
 
     override fun onResume() {
         super.onResume()
 
-        if (isReaderMode) nfcReader.enable()
-        wifiDirectManager.enable()
+        if (isNfcReaderMode) nfcReader.enable()
+        else if (isHceMode) enableHce()
+
+        if (isWifiDirectOn) wifiDirectManager.enableUpdate()
     }
 
     override fun onPause() {
         super.onPause()
 
-        if (isReaderMode) nfcReader.disable()
-        wifiDirectManager.disable()
+        if (isNfcReaderMode) nfcReader.disable()
+        else if (isHceMode) disableHce()
+
+        if (isWifiDirectOn) wifiDirectManager.disableUpdate()
     }
 
     override fun onStop() {
         super.onStop()
 
-        disableHce()
-        wifiDirectManager.removeGroup()
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-
-        disableHce()
-        wifiDirectManager.destroy()
+        if (isWifiDirectOn) wifiDirectManager.stop()
     }
 
     private fun initView() {
-        val btnSwitchMode = findViewById<Button>(R.id.btn_switch_mode)
-        btnSwitchMode.setOnClickListener {
-            switchMode()
+        txtModeStatus = findViewById<TextView>(R.id.txt_mode_status)
+        findViewById<Button>(R.id.btn_switch_mode).setOnClickListener {
+            switchModeLauncher.launch(wifiDirectPermission)
         }
     }
 
@@ -74,50 +94,77 @@ class MainActivity : AppCompatActivity() {
         nfcReader = NfcReader(this, this, aid)
         hceComponent = ComponentName(this, HceService::class.java)
 
-        nfcReader.enable()
-        isReaderMode = true
+        isNfcReaderMode = true
     }
 
     private fun setupWifiDirect() {
-        wifiDirectManager = WifiDirectManager(this)
+        wifiDirectManager = WifiDirectManager(this, this)
+        wifiDirectPermission = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        } else {
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        }
     }
 
     fun onNfcGetData(data: String) {
         nfcReader.disable()
+        isNfcReaderMode = false
 
-        val parts = data.split(":", limit = 2)
-        val ssid = parts[0]
-        val pass = parts[1]
+        nfcData = data
 
-        wifiDirectManager.connectToDevice(ssid, pass)
+        wifiDirectManager.enableUpdate()
+        isWifiDirectOn = true
+
+        connectToDeviceLauncher.launch(wifiDirectPermission)
+
+        Thread {
+            Thread.sleep(500)
+
+            wifiDirectManager.disableUpdate()
+            isWifiDirectOn = false
+
+            nfcReader.enable()
+            isNfcReaderMode = true
+        }
     }
 
     private fun switchMode() {
-        if (isReaderMode) {
+        if (isNfcReaderMode) {
             nfcReader.disable()
-            isReaderMode = false
+            isNfcReaderMode = false
 
             val prefs = getSharedPreferences("hce_data", MODE_PRIVATE)
             prefs.edit(true) { putString("aid", aid) }
 
             lifecycleScope.launch {
+                wifiDirectManager.enableUpdate()
+                isWifiDirectOn = true
+
                 val pair = wifiDirectManager.createGroupDeferred().await()
                 if (pair != null) {
                     val (ssid, pass) = pair
                     val data = "$ssid:$pass"
-                    Log.i("Test.inf", "Data in lifecy: $data")
 
                     prefs.edit(true) { putString("data", data) }
+
                     enableHce()
+                    isHceMode = true
+
+                    txtModeStatus.text = "Emulator / Host"
                 }
             }
         } else {
             disableHce()
-            wifiDirectManager.removeGroup()
+            isHceMode = false
+
+            wifiDirectManager.stop()
             deleteSharedPreferences("hce_data")
+            isWifiDirectOn = false
 
             nfcReader.enable()
-            isReaderMode = true
+            isNfcReaderMode = true
+
+            txtModeStatus.text = "Reader / Client"
         }
     }
 

@@ -7,57 +7,72 @@ import android.Manifest
 import android.content.Context
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import androidx.core.content.ContextCompat
+import androidx.annotation.RequiresPermission
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.io.PrintWriter
-import java.net.ServerSocket
-import java.net.Socket
+import com.failproger.vozduhdrop.socket.ServerSocket
+import com.failproger.vozduhdrop.socket.ClientSocket
+import com.failproger.vozduhdrop.ui.MainActivity
 
 class WifiDirectManager(
-    private var context: Context
+    private var context: Context,
+    private var activity: MainActivity
 ) : WifiP2pManager.ConnectionInfoListener {
 
     private val manager = context.getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
     private val channel = manager.initialize(context, context.mainLooper, null)
     private val receiver = WifiDirectBroadcastReceiver(manager, channel, this)
-    private var serverSocket: ServerSocket? = null
-    private var clientSocket: Socket? = null
+    private var isReceiverRegistered = false
+    private val serverSocket = ServerSocket()
+    private val clientSocket = ClientSocket(activity)
 
-    private var isServerRunning = false
-    private var isReading = false
-
-
-    fun enable() {
+    fun enableUpdate() {
         val filter = IntentFilter().apply {
             addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
             addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
         }
         context.registerReceiver(receiver, filter)
+        isReceiverRegistered = true
     }
 
-    fun disable() {
+    fun disableUpdate() {
         context.unregisterReceiver(receiver)
+        isReceiverRegistered = false
     }
 
-    fun destroy() {
-        removeGroup()
-        clientSocket?.close()
-        clientSocket = null
-        isReading = false
+    fun stop() {
+        if (isReceiverRegistered) {
+            disableUpdate()
+            isReceiverRegistered = false
+        }
+
+        serverSocket.stop()
+        clientSocket.stop()
+
+        manager.removeGroup(channel, null)
+
     }
 
+    @RequiresPermission(allOf = [
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.NEARBY_WIFI_DEVICES
+    ])
     fun createGroupDeferred(): Deferred<Pair<String, String>?> {
+        if (!hasWifiDirectPermission()) {
+            Log.e("WifiDirectOwner.err", "Nearby wifi devices permission not granted")
+            throw IllegalStateException("Nearby wifi devices permission not granted")
+        }
+
         val deferred = CompletableDeferred<Pair<String, String>?>()
 
+        manager.removeGroup(channel, null)
         manager.createGroup(channel, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d("WifiDirect.deb", "Group create success")
+                Log.i("WifiDirectOwner.inf", "Group create success")
 
                 var attempts = 0
                 val maxAttempts = 5
@@ -84,23 +99,19 @@ class WifiDirectManager(
                 requestGroupInfo()
             }
             override fun onFailure(reason: Int) {
-                Log.e("WifiDirect", "Error to create group: $reason")
+                Log.w("WifiDirectOwner.war", "Error to create group: $reason")
                 deferred.complete(null)
             }
         })
         return deferred
     }
 
-    fun removeGroup() {
-        serverSocket?.close()
-        serverSocket = null
-        isServerRunning = false
-        manager.removeGroup(channel, null)
-    }
-
     fun connectToDevice(ssid: String, pass: String) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_WIFI_STATE) != PackageManager.PERMISSION_GRANTED)
-            return
+        if (!hasWifiDirectPermission()) {
+            Log.e("WifiDirectClient.err", "Nearby wifi devices permission not granted")
+            throw IllegalStateException("Nearby wifi devices permission not granted")
+        }
+
         val config = WifiP2pConfig.Builder()
             .setNetworkName(ssid)
             .setPassphrase(pass)
@@ -108,78 +119,39 @@ class WifiDirectManager(
 
         manager.connect(channel, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                Log.d("Client.deb", "Connect to WiFi-Direct")
+                Log.i("WifiDirectClient.inf", "Success connect to $ssid")
             }
             override fun onFailure(reason: Int) {
-                Log.d("Client.err", "Connect error: $reason")
+                Log.w("WifiDirectClient.war", "Connect error: $reason")
             }
         })
     }
 
     override fun onConnectionInfoAvailable(info: WifiP2pInfo?) {
         if (info != null) {
-            if (info.isGroupOwner && !isServerRunning) {
-                Log.d("ConnChange.deb", "You are owner")
-                startServer()
+            if (info.isGroupOwner) {
+                Log.d("ConnactionInfo.deb", "You are owner")
+                serverSocket.start(8888)
             }
-            else if (!info.isGroupOwner && info.groupOwnerAddress != null) {
+            else if (info.groupOwnerAddress != null) {
                 val host = info.groupOwnerAddress.hostAddress
-                Log.d("ConnChange.deb", "HostIP: $host")
-                startClient(host)
+                Log.d("ConnactionInfo.deb", "You clinet of $host")
+                clientSocket.start(host, 8888)
             }
         }
     }
 
-    private fun startServer() {
-        Thread {
-            serverSocket = ServerSocket(8888)
-            isServerRunning = true
-            Log.d("Server.deb", "Server started")
-
-            val clientSocket = serverSocket?.accept()
-            clientSocket?.let {
-                Thread.sleep(500)
-                Log.d("Server.deb", "Client connected")
-
-                val output = it.getOutputStream()
-                val writer = PrintWriter(output, true)
-                writer.println("Hello by WiFi-Direct")
-                writer.flush()
-
-                Log.d("Server.deb", "Message send")
-                it.close()
-            }
-
-            serverSocket?.close()
-            isServerRunning = false
-        }.start()
-    }
-
-    private fun startClient(host: String) {
-        if (isReading) return
-        Thread {
-            Thread.sleep(1000)
-            try {
-                clientSocket = Socket(host, 8888)
-                isReading = true
-                val input = BufferedReader(InputStreamReader(clientSocket?.getInputStream()))
-                var line: String?
-                while (isReading && clientSocket?.isConnected == true) {
-                    line = input.readLine()
-                    if (line != null) {
-                        Log.i("Client.inf", "Get message: $line")
-                    } else {
-                        break
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            } finally {
-                isReading = false
-                clientSocket?.close()
-                clientSocket = null
-            }
-        }.start()
+    private fun hasWifiDirectPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            context.checkSelfPermission(
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        else {
+            context.checkSelfPermission(
+                Manifest.permission.NEARBY_WIFI_DEVICES
+            ) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
 }
